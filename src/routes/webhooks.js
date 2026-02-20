@@ -2,6 +2,7 @@ const express = require('express');
 const prisma = require('../lib/prisma');
 const shopify = require('../lib/shopify');
 const { notifyAvailableAgents } = require('../lib/notifications');
+const { notifyAllAgentsWebPush } = require('../lib/webPush');
 const { broadcast } = require('../lib/eventBus');
 
 const router = express.Router();
@@ -77,6 +78,21 @@ router.post('/quo', async (req, res) => {
 
   broadcast('incoming', ssePayload);
   console.log('SSE broadcast sent for', ssePayload.type);
+
+  // ── Web Push notifications (works when app is closed) ──
+  const customerName = customer ? `${customer.first_name || ''} ${customer.last_name || ''}`.trim() : null;
+  const lastOrder = recentOrders[0];
+  await notifyAllAgentsWebPush(prisma, {
+    title: isCall
+      ? `📞 ${customerName || 'Unknown Caller'}`
+      : `💬 ${customerName || 'Unknown Number'}`,
+    body: customer && lastOrder
+      ? `${lastOrder.name} — ${lastOrder.items.map(i => i.title).join(', ')}`
+      : customer
+        ? `${customer.orders_count || 0} orders · $${customer.total_spent || '0.00'} lifetime`
+        : cleanPhone,
+    data: ssePayload,
+  });
 
   // ── Push notifications (Expo, if any) ─────────────────
   if (customer) {
