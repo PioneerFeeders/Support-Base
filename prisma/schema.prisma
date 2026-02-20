@@ -1,0 +1,145 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Enums ───────────────────────────────────────────────
+
+enum Channel {
+  amazon
+  shopify
+  phone
+  text
+  email
+}
+
+enum TicketStatus {
+  open
+  in_progress
+  resolved
+  closed
+}
+
+enum Priority {
+  low
+  normal
+  high
+  urgent
+}
+
+enum SenderType {
+  customer
+  agent
+  system
+}
+
+enum ActionType {
+  reship
+  refund
+}
+
+enum ActionReason {
+  doa
+  damaged
+  missing
+  wrong_item
+  weather
+  customer_request
+  other
+}
+
+enum AgentRole {
+  admin
+  agent
+}
+
+// ─── Models ──────────────────────────────────────────────
+
+model Agent {
+  id            String      @id @default(uuid())
+  name          String
+  email         String      @unique
+  passwordHash  String      @map("password_hash")
+  role          AgentRole   @default(agent)
+  pushToken     String?     @map("push_token")
+  isAvailable   Boolean     @default(true) @map("is_available")
+  createdAt     DateTime    @default(now()) @map("created_at")
+  updatedAt     DateTime    @updatedAt @map("updated_at")
+
+  tickets       Ticket[]    @relation("AssignedTickets")
+  messages      TicketMessage[]
+  actions       Action[]
+
+  @@map("agents")
+}
+
+model Ticket {
+  id                 String       @id @default(uuid())
+  channel            Channel
+  status             TicketStatus @default(open)
+  priority           Priority     @default(normal)
+  subject            String
+  customerName       String?      @map("customer_name")
+  customerEmail      String?      @map("customer_email")
+  customerPhone      String?      @map("customer_phone")
+  shopifyCustomerId  String?      @map("shopify_customer_id")
+  amazonOrderId      String?      @map("amazon_order_id")
+  assignedAgentId    String?      @map("assigned_agent_id")
+  assignedAgent      Agent?       @relation("AssignedTickets", fields: [assignedAgentId], references: [id])
+  createdAt          DateTime     @default(now()) @map("created_at")
+  updatedAt          DateTime     @updatedAt @map("updated_at")
+  resolvedAt         DateTime?    @map("resolved_at")
+
+  messages           TicketMessage[]
+  actions            Action[]
+
+  @@index([channel])
+  @@index([status])
+  @@index([assignedAgentId])
+  @@index([shopifyCustomerId])
+  @@map("tickets")
+}
+
+model TicketMessage {
+  id               String     @id @default(uuid())
+  ticketId         String     @map("ticket_id")
+  ticket           Ticket     @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  senderType       SenderType @map("sender_type")
+  senderAgentId    String?    @map("sender_agent_id")
+  senderAgent      Agent?     @relation(fields: [senderAgentId], references: [id])
+  body             String
+  amazonMessageId  String?    @map("amazon_message_id")
+  createdAt        DateTime   @default(now()) @map("created_at")
+
+  @@index([ticketId])
+  @@map("ticket_messages")
+}
+
+model Action {
+  id              String       @id @default(uuid())
+  ticketId        String?      @map("ticket_id")
+  ticket          Ticket?      @relation(fields: [ticketId], references: [id])
+  type            ActionType
+  channel         Channel
+  reason          ActionReason
+  originalOrderId String       @map("original_order_id")
+  newOrderId      String?      @map("new_order_id")
+  amount          Decimal      @db.Decimal(10, 2)
+  items           Json         @default("[]")
+  shippingMethod  String?      @map("shipping_method")
+  carrier         String?
+  notes           String?
+  agentId         String       @map("agent_id")
+  agent           Agent        @relation(fields: [agentId], references: [id])
+  createdAt       DateTime     @default(now()) @map("created_at")
+
+  @@index([type])
+  @@index([channel])
+  @@index([reason])
+  @@index([createdAt])
+  @@map("actions")
+}
