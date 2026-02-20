@@ -10,6 +10,7 @@ const orderRoutes = require('./routes/orders');
 const ticketRoutes = require('./routes/tickets');
 const analyticsRoutes = require('./routes/analytics');
 const webhookRoutes = require('./routes/webhooks');
+const eventRoutes = require('./routes/events');
 const { errorHandler } = require('./middleware/errorHandler');
 
 const app = express();
@@ -41,6 +42,7 @@ app.use('/api/v1/orders', orderRoutes);
 app.use('/api/v1/tickets', ticketRoutes);
 app.use('/api/v1/analytics', analyticsRoutes);
 app.use('/api/v1/webhooks', webhookRoutes);
+app.use('/api/v1/events', eventRoutes);
 
 // Error handler
 app.use(errorHandler);
