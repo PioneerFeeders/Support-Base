@@ -66,6 +66,7 @@ model Agent {
   passwordHash  String      @map("password_hash")
   role          AgentRole   @default(agent)
   pushToken     String?     @map("push_token")
+  webPushSub    Json?       @map("web_push_sub")
   isAvailable   Boolean     @default(true) @map("is_available")
   createdAt     DateTime    @default(now()) @map("created_at")
   updatedAt     DateTime    @updatedAt @map("updated_at")
