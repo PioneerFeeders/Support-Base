@@ -7,26 +7,31 @@ const router = express.Router();
 
 // POST /webhooks/quo — Incoming call or text from Quo
 router.post('/quo', async (req, res) => {
-  const { event, participants, from, body: messageBody } = req.body;
+  console.log('Quo webhook received:', JSON.stringify(req.body, null, 2));
 
-  // Extract phone number from Quo payload
-  let phone = null;
-  if (participants && Array.isArray(participants)) {
-    // Find the external participant (not our business number)
-    const external = participants.find(p => p.type === 'external' || p.direction === 'inbound');
-    phone = external?.number || external?.phone || participants[0]?.number;
-  }
-  if (!phone && from) {
-    phone = from;
+  // Quo API v3 payload structure:
+  // { type: "call.ringing", data: { object: { from, to, direction, status, ... } } }
+  // { type: "message.received", data: { object: { from, to, body, direction, ... } } }
+  const eventType = req.body.type || req.body.event;
+  const dataObj = req.body.data?.object || {};
+
+  // Extract phone number — Quo puts it in data.object.from
+  let phone = dataObj.from || req.body.from;
+
+  // Also check participants array (fallback for other formats)
+  if (!phone && req.body.participants && Array.isArray(req.body.participants)) {
+    const external = req.body.participants.find(p => p.type === 'external' || p.direction === 'inbound');
+    phone = external?.number || external?.phone || req.body.participants[0]?.number;
   }
 
   if (!phone) {
-    console.log('Quo webhook: no phone number found in payload', req.body);
+    console.log('Quo webhook: no phone number found in payload');
     return res.json({ received: true, matched: false });
   }
 
   // Clean phone number
   const cleanPhone = phone.replace(/[^\d+]/g, '');
+  console.log(`Quo webhook: event=${eventType}, phone=${cleanPhone}`);
 
   // Search Shopify for customer by phone
   let customer = null;
@@ -48,8 +53,9 @@ router.post('/quo', async (req, res) => {
     console.error('Shopify lookup error:', err.message);
   }
 
-  const isCall = event === 'call.ringing' || event === 'call.started';
-  const isText = event === 'message.received';
+  const isCall = eventType === 'call.ringing' || eventType === 'call.started' || eventType === 'call.answered';
+  const isText = eventType === 'message.received';
+  const messageBody = dataObj.body || dataObj.text || req.body.body;
 
   if (customer) {
     const customerName = `${customer.first_name || ''} ${customer.last_name || ''}`.trim();
@@ -70,9 +76,23 @@ router.post('/quo', async (req, res) => {
       },
     });
 
+    // Create ticket for calls
+    if (isCall) {
+      await prisma.ticket.create({
+        data: {
+          channel: 'phone',
+          subject: `Call from ${customerName}`,
+          customerName,
+          customerEmail: customer.email,
+          customerPhone: cleanPhone,
+          shopifyCustomerId: String(customer.id),
+        },
+      });
+    }
+
     // Create ticket for text messages
     if (isText && messageBody) {
-      await prisma.ticket.create({
+      const ticket = await prisma.ticket.create({
         data: {
           channel: 'text',
           subject: `Text from ${customerName}`,
@@ -83,21 +103,13 @@ router.post('/quo', async (req, res) => {
         },
       });
 
-      // Add the message
-      const ticket = await prisma.ticket.findFirst({
-        where: { customerPhone: cleanPhone },
-        orderBy: { createdAt: 'desc' },
+      await prisma.ticketMessage.create({
+        data: {
+          ticketId: ticket.id,
+          senderType: 'customer',
+          body: messageBody,
+        },
       });
-
-      if (ticket) {
-        await prisma.ticketMessage.create({
-          data: {
-            ticketId: ticket.id,
-            senderType: 'customer',
-            body: messageBody,
-          },
-        });
-      }
     }
   } else {
     // Unknown caller
@@ -111,6 +123,17 @@ router.post('/quo', async (req, res) => {
         phone: cleanPhone,
       },
     });
+
+    // Create ticket for call from unknown
+    if (isCall) {
+      await prisma.ticket.create({
+        data: {
+          channel: 'phone',
+          subject: `Call from ${cleanPhone}`,
+          customerPhone: cleanPhone,
+        },
+      });
+    }
 
     // Create ticket for text from unknown
     if (isText && messageBody) {
@@ -137,13 +160,11 @@ router.post('/quo', async (req, res) => {
 
 // POST /webhooks/shopify — Order webhooks
 router.post('/shopify', async (req, res) => {
-  // Verify Shopify webhook (TODO: add HMAC verification)
   const topic = req.headers['x-shopify-topic'];
   const order = req.body;
 
   console.log(`Shopify webhook: ${topic} for order ${order?.name}`);
 
-  // For now, just acknowledge — we'll use this for real-time order updates later
   res.json({ received: true, topic });
 });
 
