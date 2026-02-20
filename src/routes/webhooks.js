@@ -2,6 +2,7 @@ const express = require('express');
 const prisma = require('../lib/prisma');
 const shopify = require('../lib/shopify');
 const { notifyAvailableAgents } = require('../lib/notifications');
+const { broadcast } = require('../lib/eventBus');
 
 const router = express.Router();
 
@@ -9,16 +10,11 @@ const router = express.Router();
 router.post('/quo', async (req, res) => {
   console.log('Quo webhook received:', JSON.stringify(req.body, null, 2));
 
-  // Quo API v3 payload structure:
-  // { type: "call.ringing", data: { object: { from, to, direction, status, ... } } }
-  // { type: "message.received", data: { object: { from, to, body, direction, ... } } }
   const eventType = req.body.type || req.body.event;
   const dataObj = req.body.data?.object || {};
 
-  // Extract phone number — Quo puts it in data.object.from
   let phone = dataObj.from || req.body.from;
 
-  // Also check participants array (fallback for other formats)
   if (!phone && req.body.participants && Array.isArray(req.body.participants)) {
     const external = req.body.participants.find(p => p.type === 'external' || p.direction === 'inbound');
     phone = external?.number || external?.phone || req.body.participants[0]?.number;
@@ -29,7 +25,6 @@ router.post('/quo', async (req, res) => {
     return res.json({ received: true, matched: false });
   }
 
-  // Clean phone number
   const cleanPhone = phone.replace(/[^\d+]/g, '');
   console.log(`Quo webhook: event=${eventType}, phone=${cleanPhone}`);
 
@@ -42,11 +37,17 @@ router.post('/quo', async (req, res) => {
       customer = customers[0];
       const orders = await shopify.getCustomerOrders(customer.id, 3);
       recentOrders = orders.map(o => ({
+        id: o.id,
         name: o.name,
         date: o.created_at,
         total: o.total_price,
-        items: o.line_items.map(i => i.title).join(', '),
+        totalPrice: o.total_price,
+        items: o.line_items.map(i => ({ title: i.title, quantity: i.quantity, price: i.price, sku: i.sku, variantId: i.variant_id })),
+        lineItems: o.line_items.map(i => ({ id: i.id, title: i.title, quantity: i.quantity, price: i.price, sku: i.sku, variantId: i.variant_id })),
         fulfillmentStatus: o.fulfillment_status,
+        shippingLines: o.shipping_lines,
+        channel: 'shopify',
+        createdAt: o.created_at,
       }));
     }
   } catch (err) {
@@ -57,100 +58,80 @@ router.post('/quo', async (req, res) => {
   const isText = eventType === 'message.received';
   const messageBody = dataObj.body || dataObj.text || req.body.body;
 
+  // ── Broadcast to PWA via SSE ──────────────────────────
+  const ssePayload = {
+    type: isCall ? 'incoming_call' : 'incoming_text',
+    phone: cleanPhone,
+    messageBody: isText ? messageBody : null,
+    timestamp: new Date().toISOString(),
+    customer: customer ? {
+      id: customer.id,
+      name: `${customer.first_name || ''} ${customer.last_name || ''}`.trim(),
+      email: customer.email,
+      phone: customer.phone || cleanPhone,
+      ordersCount: customer.orders_count || 0,
+      totalSpent: customer.total_spent || '0.00',
+    } : null,
+    recentOrders,
+  };
+
+  broadcast('incoming', ssePayload);
+  console.log('SSE broadcast sent for', ssePayload.type);
+
+  // ── Push notifications (Expo, if any) ─────────────────
   if (customer) {
     const customerName = `${customer.first_name || ''} ${customer.last_name || ''}`.trim();
     const lastOrder = recentOrders[0];
 
-    // Send push notification with customer info
     await notifyAvailableAgents(prisma, {
       title: isCall ? `📞 ${customerName}` : `💬 ${customerName}`,
       body: lastOrder
-        ? `${lastOrder.name} — ${lastOrder.items} (${lastOrder.fulfillmentStatus || 'pending'})`
+        ? `${lastOrder.name} — ${lastOrder.items.map(i => i.title).join(', ')} (${lastOrder.fulfillmentStatus || 'pending'})`
         : `${customer.orders_count || 0} orders · $${customer.total_spent || '0.00'} lifetime`,
-      data: {
-        type: isCall ? 'incoming_call' : 'incoming_text',
-        customerId: String(customer.id),
-        customerName,
-        phone: cleanPhone,
-        recentOrders,
-      },
+      data: { type: isCall ? 'incoming_call' : 'incoming_text', customerId: String(customer.id), customerName, phone: cleanPhone },
     });
 
-    // Create ticket for calls
     if (isCall) {
       await prisma.ticket.create({
         data: {
-          channel: 'phone',
-          subject: `Call from ${customerName}`,
-          customerName,
-          customerEmail: customer.email,
-          customerPhone: cleanPhone,
+          channel: 'phone', subject: `Call from ${customerName}`,
+          customerName, customerEmail: customer.email, customerPhone: cleanPhone,
           shopifyCustomerId: String(customer.id),
         },
       });
     }
 
-    // Create ticket for text messages
     if (isText && messageBody) {
       const ticket = await prisma.ticket.create({
         data: {
-          channel: 'text',
-          subject: `Text from ${customerName}`,
-          customerName,
-          customerEmail: customer.email,
-          customerPhone: cleanPhone,
+          channel: 'text', subject: `Text from ${customerName}`,
+          customerName, customerEmail: customer.email, customerPhone: cleanPhone,
           shopifyCustomerId: String(customer.id),
         },
       });
-
       await prisma.ticketMessage.create({
-        data: {
-          ticketId: ticket.id,
-          senderType: 'customer',
-          body: messageBody,
-        },
+        data: { ticketId: ticket.id, senderType: 'customer', body: messageBody },
       });
     }
   } else {
-    // Unknown caller
     await notifyAvailableAgents(prisma, {
       title: isCall ? '📞 Unknown Caller' : '💬 Unknown Number',
       body: cleanPhone,
-      data: {
-        type: isCall ? 'incoming_call' : 'incoming_text',
-        customerId: null,
-        customerName: null,
-        phone: cleanPhone,
-      },
+      data: { type: isCall ? 'incoming_call' : 'incoming_text', customerId: null, customerName: null, phone: cleanPhone },
     });
 
-    // Create ticket for call from unknown
     if (isCall) {
       await prisma.ticket.create({
-        data: {
-          channel: 'phone',
-          subject: `Call from ${cleanPhone}`,
-          customerPhone: cleanPhone,
-        },
+        data: { channel: 'phone', subject: `Call from ${cleanPhone}`, customerPhone: cleanPhone },
       });
     }
 
-    // Create ticket for text from unknown
     if (isText && messageBody) {
       const ticket = await prisma.ticket.create({
-        data: {
-          channel: 'text',
-          subject: `Text from ${cleanPhone}`,
-          customerPhone: cleanPhone,
-        },
+        data: { channel: 'text', subject: `Text from ${cleanPhone}`, customerPhone: cleanPhone },
       });
-
       await prisma.ticketMessage.create({
-        data: {
-          ticketId: ticket.id,
-          senderType: 'customer',
-          body: messageBody,
-        },
+        data: { ticketId: ticket.id, senderType: 'customer', body: messageBody },
       });
     }
   }
@@ -161,10 +142,7 @@ router.post('/quo', async (req, res) => {
 // POST /webhooks/shopify — Order webhooks
 router.post('/shopify', async (req, res) => {
   const topic = req.headers['x-shopify-topic'];
-  const order = req.body;
-
-  console.log(`Shopify webhook: ${topic} for order ${order?.name}`);
-
+  console.log(`Shopify webhook: ${topic} for order ${req.body?.name}`);
   res.json({ received: true, topic });
 });
 
