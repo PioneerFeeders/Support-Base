@@ -7,6 +7,101 @@ const { broadcast } = require('../lib/eventBus');
 
 const router = express.Router();
 
+const REOPEN_WINDOW_DAYS = 7;
+
+// ── Find or create ticket for a phone number ────────────
+// 1. Open/in_progress ticket exists → use it
+// 2. Resolved ticket within REOPEN_WINDOW_DAYS → reopen it
+// 3. Otherwise → create new ticket
+async function findOrCreateTicket(phone, { channel, customerName, customerEmail, shopifyCustomerId }) {
+  // 1. Check for open/in_progress ticket for this phone
+  const activeTicket = await prisma.ticket.findFirst({
+    where: {
+      customerPhone: phone,
+      channel,
+      status: { in: ['open', 'in_progress'] },
+    },
+    orderBy: { updatedAt: 'desc' },
+  });
+
+  if (activeTicket) {
+    console.log(`Ticket threading: adding to active ticket ${activeTicket.id}`);
+    return { ticket: activeTicket, action: 'existing' };
+  }
+
+  // 2. Check for recently resolved ticket (within reopen window)
+  const reopenCutoff = new Date();
+  reopenCutoff.setDate(reopenCutoff.getDate() - REOPEN_WINDOW_DAYS);
+
+  const resolvedTicket = await prisma.ticket.findFirst({
+    where: {
+      customerPhone: phone,
+      channel,
+      status: 'resolved',
+      resolvedAt: { gte: reopenCutoff },
+    },
+    orderBy: { resolvedAt: 'desc' },
+  });
+
+  if (resolvedTicket) {
+    console.log(`Ticket threading: reopening resolved ticket ${resolvedTicket.id}`);
+    const reopened = await prisma.ticket.update({
+      where: { id: resolvedTicket.id },
+      data: {
+        status: 'open',
+        resolvedAt: null,
+        resolutionType: null,
+        resolutionReason: null,
+      },
+    });
+    // Add a system message noting the reopen
+    await prisma.ticketMessage.create({
+      data: {
+        ticketId: reopened.id,
+        senderType: 'system',
+        body: 'Ticket reopened — customer sent a new message',
+      },
+    });
+    return { ticket: reopened, action: 'reopened' };
+  }
+
+  // 3. Create new ticket
+  const subject = customerName
+    ? `${channel === 'text' ? 'Text' : 'Call'} from ${customerName}`
+    : `${channel === 'text' ? 'Text' : 'Call'} from ${phone}`;
+
+  const newTicket = await prisma.ticket.create({
+    data: {
+      channel,
+      subject,
+      customerName: customerName || null,
+      customerEmail: customerEmail || null,
+      customerPhone: phone,
+      shopifyCustomerId: shopifyCustomerId || null,
+    },
+  });
+
+  console.log(`Ticket threading: created new ticket ${newTicket.id}`);
+  return { ticket: newTicket, action: 'created' };
+}
+
+// ── Auto-close old resolved tickets ─────────────────────
+// Tickets resolved more than REOPEN_WINDOW_DAYS ago get closed automatically
+async function autoCloseOldTickets() {
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - REOPEN_WINDOW_DAYS);
+
+  const { count } = await prisma.ticket.updateMany({
+    where: {
+      status: 'resolved',
+      resolvedAt: { lt: cutoff },
+    },
+    data: { status: 'closed' },
+  });
+
+  if (count > 0) console.log(`Auto-closed ${count} old resolved ticket(s)`);
+}
+
 // POST /webhooks/quo — Incoming call or text from Quo
 router.post('/quo', async (req, res) => {
   console.log('Quo webhook received:', JSON.stringify(req.body, null, 2));
@@ -28,6 +123,9 @@ router.post('/quo', async (req, res) => {
 
   const cleanPhone = phone.replace(/[^\d+]/g, '');
   console.log(`Quo webhook: event=${eventType}, phone=${cleanPhone}`);
+
+  // Auto-close old resolved tickets on each webhook (lightweight)
+  await autoCloseOldTickets().catch(err => console.error('Auto-close error:', err.message));
 
   // Search Shopify for customer by phone
   let customer = null;
@@ -59,6 +157,8 @@ router.post('/quo', async (req, res) => {
   const isText = eventType === 'message.received';
   const messageBody = dataObj.body || dataObj.text || req.body.body;
 
+  const customerName = customer ? `${customer.first_name || ''} ${customer.last_name || ''}`.trim() : null;
+
   // ── Broadcast to PWA via SSE ──────────────────────────
   const ssePayload = {
     type: isCall ? 'incoming_call' : 'incoming_text',
@@ -67,7 +167,7 @@ router.post('/quo', async (req, res) => {
     timestamp: new Date().toISOString(),
     customer: customer ? {
       id: customer.id,
-      name: `${customer.first_name || ''} ${customer.last_name || ''}`.trim(),
+      name: customerName,
       email: customer.email,
       phone: customer.phone || cleanPhone,
       ordersCount: customer.orders_count || 0,
@@ -80,7 +180,6 @@ router.post('/quo', async (req, res) => {
   console.log('SSE broadcast sent for', ssePayload.type);
 
   // ── Web Push notifications (works when app is closed) ──
-  const customerName = customer ? `${customer.first_name || ''} ${customer.last_name || ''}`.trim() : null;
   const lastOrder = recentOrders[0];
   await notifyAllAgentsWebPush(prisma, {
     title: isCall
@@ -94,62 +193,47 @@ router.post('/quo', async (req, res) => {
     data: ssePayload,
   });
 
-  // ── Push notifications (Expo, if any) ─────────────────
-  if (customer) {
-    const customerName = `${customer.first_name || ''} ${customer.last_name || ''}`.trim();
-    const lastOrder = recentOrders[0];
+  // ── Expo push notifications ───────────────────────────
+  await notifyAvailableAgents(prisma, {
+    title: isCall
+      ? `📞 ${customerName || 'Unknown Caller'}`
+      : `💬 ${customerName || 'Unknown Number'}`,
+    body: customer && lastOrder
+      ? `${lastOrder.name} — ${lastOrder.items.map(i => i.title).join(', ')}`
+      : cleanPhone,
+    data: { type: isCall ? 'incoming_call' : 'incoming_text', customerId: customer ? String(customer.id) : null, customerName, phone: cleanPhone },
+  });
 
-    await notifyAvailableAgents(prisma, {
-      title: isCall ? `📞 ${customerName}` : `💬 ${customerName}`,
-      body: lastOrder
-        ? `${lastOrder.name} — ${lastOrder.items.map(i => i.title).join(', ')} (${lastOrder.fulfillmentStatus || 'pending'})`
-        : `${customer.orders_count || 0} orders · $${customer.total_spent || '0.00'} lifetime`,
-      data: { type: isCall ? 'incoming_call' : 'incoming_text', customerId: String(customer.id), customerName, phone: cleanPhone },
+  // ── Ticket creation / threading ───────────────────────
+  if (isCall) {
+    const { ticket, action } = await findOrCreateTicket(cleanPhone, {
+      channel: 'phone',
+      customerName,
+      customerEmail: customer?.email,
+      shopifyCustomerId: customer ? String(customer.id) : null,
+    });
+    console.log(`Call ticket: ${action} → ${ticket.id}`);
+  }
+
+  if (isText && messageBody) {
+    const { ticket, action } = await findOrCreateTicket(cleanPhone, {
+      channel: 'text',
+      customerName,
+      customerEmail: customer?.email,
+      shopifyCustomerId: customer ? String(customer.id) : null,
     });
 
-    if (isCall) {
-      await prisma.ticket.create({
-        data: {
-          channel: 'phone', subject: `Call from ${customerName}`,
-          customerName, customerEmail: customer.email, customerPhone: cleanPhone,
-          shopifyCustomerId: String(customer.id),
-        },
-      });
-    }
-
-    if (isText && messageBody) {
-      const ticket = await prisma.ticket.create({
-        data: {
-          channel: 'text', subject: `Text from ${customerName}`,
-          customerName, customerEmail: customer.email, customerPhone: cleanPhone,
-          shopifyCustomerId: String(customer.id),
-        },
-      });
-      await prisma.ticketMessage.create({
-        data: { ticketId: ticket.id, senderType: 'customer', body: messageBody },
-      });
-    }
-  } else {
-    await notifyAvailableAgents(prisma, {
-      title: isCall ? '📞 Unknown Caller' : '💬 Unknown Number',
-      body: cleanPhone,
-      data: { type: isCall ? 'incoming_call' : 'incoming_text', customerId: null, customerName: null, phone: cleanPhone },
+    await prisma.ticketMessage.create({
+      data: { ticketId: ticket.id, senderType: 'customer', body: messageBody },
     });
 
-    if (isCall) {
-      await prisma.ticket.create({
-        data: { channel: 'phone', subject: `Call from ${cleanPhone}`, customerPhone: cleanPhone },
-      });
-    }
+    // Touch the ticket so it moves to top of inbox
+    await prisma.ticket.update({
+      where: { id: ticket.id },
+      data: { updatedAt: new Date() },
+    });
 
-    if (isText && messageBody) {
-      const ticket = await prisma.ticket.create({
-        data: { channel: 'text', subject: `Text from ${cleanPhone}`, customerPhone: cleanPhone },
-      });
-      await prisma.ticketMessage.create({
-        data: { ticketId: ticket.id, senderType: 'customer', body: messageBody },
-      });
-    }
+    console.log(`Text ticket: ${action} → ${ticket.id}, message added`);
   }
 
   res.json({ received: true, matched: !!customer });

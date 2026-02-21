@@ -1,4 +1,3 @@
-
 const express = require('express');
 const { authenticate } = require('../middleware/auth');
 const { addClient, getClientCount } = require('../lib/eventBus');

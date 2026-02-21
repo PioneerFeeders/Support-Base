@@ -6,11 +6,16 @@ const router = express.Router();
 
 // GET /tickets — List with filters
 router.get('/', authenticate, async (req, res) => {
-  const { channel, status, priority, limit = 50, offset = 0 } = req.query;
+  const { channel, status, priority, showAll, limit = 50, offset = 0 } = req.query;
 
   const where = {};
   if (channel) where.channel = channel;
-  if (status) where.status = status;
+  if (status) {
+    where.status = status;
+  } else if (!showAll) {
+    // By default, only show open and in_progress tickets
+    where.status = { in: ['open', 'in_progress'] };
+  }
   if (priority) where.priority = priority;
 
   const [tickets, total] = await Promise.all([
@@ -171,6 +176,42 @@ router.post('/:id/messages', authenticate, async (req, res) => {
   // TODO: If ticket.channel === 'amazon', send reply via SP-API
 
   res.status(201).json({ message });
+});
+
+// GET /tickets/history/:phone — Get all past tickets for a phone number
+router.get('/history/:phone', authenticate, async (req, res) => {
+  const phone = req.params.phone;
+
+  const tickets = await prisma.ticket.findMany({
+    where: { customerPhone: phone },
+    orderBy: { createdAt: 'desc' },
+    take: 20,
+    include: {
+      _count: { select: { messages: true, actions: true } },
+      actions: {
+        orderBy: { createdAt: 'desc' },
+        select: { id: true, type: true, reason: true, amount: true, originalOrderId: true, createdAt: true },
+      },
+    },
+  });
+
+  res.json({
+    tickets: tickets.map(t => ({
+      id: t.id,
+      channel: t.channel,
+      status: t.status,
+      subject: t.subject,
+      customerName: t.customerName,
+      resolutionType: t.resolutionType,
+      resolutionReason: t.resolutionReason,
+      messageCount: t._count.messages,
+      actionCount: t._count.actions,
+      actions: t.actions,
+      createdAt: t.createdAt,
+      updatedAt: t.updatedAt,
+      resolvedAt: t.resolvedAt,
+    })),
+  });
 });
 
 module.exports = router;
