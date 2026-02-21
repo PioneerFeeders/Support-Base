@@ -113,7 +113,7 @@ router.post('/', authenticate, async (req, res) => {
 
 // PUT /tickets/:id — Update ticket
 router.put('/:id', authenticate, async (req, res) => {
-  const { status, priority, assignedAgentId } = req.body;
+  const { status, priority, assignedAgentId, resolutionType, resolutionReason } = req.body;
   const data = {};
 
   if (status) {
@@ -124,6 +124,8 @@ router.put('/:id', authenticate, async (req, res) => {
   }
   if (priority) data.priority = priority;
   if (assignedAgentId !== undefined) data.assignedAgentId = assignedAgentId;
+  if (resolutionType) data.resolutionType = resolutionType;
+  if (resolutionReason) data.resolutionReason = resolutionReason;
 
   const ticket = await prisma.ticket.update({
     where: { id: req.params.id },
